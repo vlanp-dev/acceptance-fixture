@@ -1,0 +1,163 @@
+name: acceptance-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Submit to dev only, or dev and production"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, both]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image base
+        id: image
+        run: |
+          echo "base=ghcr.io/$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push front-accept
+        id: front
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/front-accept
+          push: true
+          tags: ${{ steps.image.outputs.base }}/front-accept:${{ github.sha }}
+
+      - name: Build and push ms-accept
+        id: backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/ms-accept
+          push: true
+          tags: ${{ steps.image.outputs.base }}/ms-accept:${{ github.sha }}
+
+      - name: Write the release artifact
+        env:
+          IMAGE_BASE: ${{ steps.image.outputs.base }}
+          FRONT_DIGEST: ${{ steps.front.outputs.digest }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          contract_digest="sha256:$(sha256sum compose.yaml | awk '{print $1}')"
+          jq -n \
+            --arg contract "$contract_digest" \
+            --arg base "$IMAGE_BASE" \
+            --arg front "$FRONT_DIGEST" \
+            --arg backend "$BACKEND_DIGEST" \
+            '{
+              contractDigest: $contract,
+              images: [
+                {service: "front-accept", reference: ($base + "/front-accept@" + $front), digest: $front},
+                {service: "ms-accept", reference: ($base + "/ms-accept@" + $backend), digest: $backend}
+              ]
+            }' > release.json
+          cat release.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release.json
+
+  release:
+    needs: build
+    runs-on: [self-hosted, app-deployer-acceptance]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      - name: Submit the release with GitHub OIDC
+        env:
+          TARGET: ${{ inputs.target || 'dev' }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { echo "jq is required on the self-hosted runner" >&2; exit 1; }
+
+          oidc="$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=app-deployer" | jq -r .value)"
+
+          contract_digest="$(jq -r .contractDigest release.json)"
+          images="$(jq -c .images release.json)"
+
+          body="$(jq -n \
+            --arg repository "$REPOSITORY" \
+            --arg branch "$DEFAULT_BRANCH" \
+            --arg sha "$COMMIT_SHA" \
+            --arg contract "$contract_digest" \
+            --argjson images "$images" \
+            --arg runId "$RUN_ID" \
+            --arg runAttempt "$RUN_ATTEMPT" \
+            '{
+              service: "ms-accept",
+              repository: $repository,
+              defaultBranch: $branch,
+              ref: ("refs/heads/" + $branch),
+              commitSha: $sha,
+              contractDigest: $contract,
+              images: $images,
+              workflow: ".github/workflows/deploy.yml",
+              runId: $runId,
+              runAttempt: $runAttempt,
+              conclusion: "success"
+            }')"
+
+          submit() {
+            local label="$1"
+            local url="$2"
+            local key="$3"
+            local body_file status
+            body_file="$(mktemp)"
+            status="$(curl -sS -o "$body_file" -w '%{http_code}' \
+              -X POST "$url/v1/releases" \
+              -H "Authorization: Bearer ${oidc}" \
+              -H "Content-Type: application/json" \
+              -H "Idempotency-Key: ${key}" \
+              -d "$body")"
+            cat "$body_file" | jq .
+            if [[ "$status" != "202" ]]; then
+              echo "the ${label} deployer refused the release (HTTP ${status})" >&2
+              exit 1
+            fi
+            echo "### ${label}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- deployment: \`$(jq -r .deploymentId "$body_file")\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- release: \`$(jq -r .releaseId "$body_file")\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- status: \`$(jq -r .status "$body_file")\`" >> "$GITHUB_STEP_SUMMARY"
+            rm -f "$body_file"
+          }
+
+          submit dev "http://127.0.0.1:8790" "${RUN_ID}-${RUN_ATTEMPT}-dev"
+          if [[ "$TARGET" == "both" ]]; then
+            submit production "http://127.0.0.1:8791" "${RUN_ID}-${RUN_ATTEMPT}-prod"
+            echo "Production is AWAITING_APPROVAL; approve it with the operator token." >> "$GITHUB_STEP_SUMMARY"
+          fi

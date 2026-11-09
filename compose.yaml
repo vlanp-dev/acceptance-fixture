@@ -1,0 +1,36 @@
+services:
+  front-accept:
+    build:
+      context: apps/front-accept
+    expose:
+      - "3000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  ms-accept:
+    build:
+      context: apps/ms-accept
+    expose:
+      - "8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+x-ai-builder:
+  version: 1
+  services:
+    front-accept:
+      kind: frontend
+      route: builder-front-accept.vlanp.com
+      health: /health
+    ms-accept:
+      kind: backend
+      route: builder-ms-accept.vlanp.com
+      health: /health
+      database: true
+      migration: node migrate.mjs
